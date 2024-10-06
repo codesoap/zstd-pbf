@@ -26,6 +26,7 @@ var speedBetterCompression bool
 var speedBestCompression bool
 var inFile = ""
 var outFile = ""
+var zstdEncoder *zstd.Encoder
 
 func init() {
 	flag.Usage = func() {
@@ -70,9 +71,16 @@ func init() {
 		fmt.Fprintf(os.Stderr, "The file '%s' already exists.\n", outFile)
 		os.Exit(1)
 	}
+
+	var err error
+	zstdEncoder, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(compressionLevel))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Could not create zstd encoder: %v", err)
+	}
 }
 
 func main() {
+	defer zstdEncoder.Close()
 	in, err := os.Open(inFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Could not open file '%s': %v", inFile, err)
@@ -159,18 +167,8 @@ func recompressData(blob *pbfproto.Blob) error {
 	if err != nil {
 		return err
 	}
-	in := bytes.NewReader(rawData)
-	out := new(bytes.Buffer)
-	enc, err := zstd.NewWriter(out, zstd.WithEncoderLevel(compressionLevel))
-	if err != nil {
-		return err
-	}
-	if _, err = io.Copy(enc, in); err != nil {
-		enc.Close()
-		return err
-	}
-	err = enc.Close()
-	blob.Data = &pbfproto.Blob_ZstdData{ZstdData: out.Bytes()}
+	out := zstdEncoder.EncodeAll(rawData, nil)
+	blob.Data = &pbfproto.Blob_ZstdData{ZstdData: out}
 	return err
 }
 
