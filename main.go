@@ -27,6 +27,8 @@ var speedBestCompression bool
 var inFile = ""
 var outFile = ""
 var zstdEncoder *zstd.Encoder
+var headerSizeBuf = make([]byte, 4)
+var rawBlobBuf []byte
 
 func init() {
 	flag.Usage = func() {
@@ -145,21 +147,22 @@ func readBlobHeader(in *os.File) (*pbfproto.BlobHeader, error) {
 	if err != nil {
 		return nil, err
 	}
-	rawBlobHeader, err := io.ReadAll(io.LimitReader(in, int64(size)))
+	rawBlobBuf, err = readAllIntoBuf(io.LimitReader(in, int64(size)), rawBlobBuf)
 	if err != nil {
 		return nil, fmt.Errorf("could not read BlobHeader: %v", err)
 	}
 	header := &pbfproto.BlobHeader{}
-	return header, proto.Unmarshal(rawBlobHeader, header)
+	return header, proto.Unmarshal(rawBlobBuf, header)
 }
 
 func readBlob(header *pbfproto.BlobHeader, in *os.File) (*pbfproto.Blob, error) {
-	rawBlob, err := io.ReadAll(io.LimitReader(in, int64(*header.Datasize)))
+	var err error
+	rawBlobBuf, err = readAllIntoBuf(io.LimitReader(in, int64(*header.Datasize)), rawBlobBuf)
 	if err != nil {
 		return nil, err
 	}
 	blob := &pbfproto.Blob{}
-	return blob, proto.Unmarshal(rawBlob, blob)
+	return blob, proto.Unmarshal(rawBlobBuf, blob)
 }
 
 func recompressData(blob *pbfproto.Blob) error {
@@ -177,9 +180,8 @@ func writeBlobHeader(header *pbfproto.BlobHeader, out *os.File) error {
 	if err != nil {
 		return err
 	}
-	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, uint32(len(rawHeader)))
-	if _, err := out.Write(buf); err != nil {
+	binary.BigEndian.PutUint32(headerSizeBuf, uint32(len(rawHeader)))
+	if _, err := out.Write(headerSizeBuf); err != nil {
 		return err
 	}
 	_, err = out.Write(rawHeader)
@@ -187,11 +189,10 @@ func writeBlobHeader(header *pbfproto.BlobHeader, out *os.File) error {
 }
 
 func getBlobHeaderSize(file *os.File) (uint32, error) {
-	buf := make([]byte, 4)
-	if _, err := io.ReadFull(file, buf); err != nil {
+	if _, err := io.ReadFull(file, headerSizeBuf); err != nil {
 		return 0, err
 	}
-	size := binary.BigEndian.Uint32(buf)
+	size := binary.BigEndian.Uint32(headerSizeBuf)
 	if size >= maxBlobHeaderSize {
 		return 0, fmt.Errorf("blobHeader size %d >= 64KiB", size)
 	}
@@ -213,7 +214,10 @@ func toRawData(blob *pbfproto.Blob) ([]byte, error) {
 		if err != nil {
 			return data, fmt.Errorf("could not decompress zlib blob: %v", err)
 		}
-		data = make([]byte, *blob.RawSize)
+		if cap(rawBlobBuf) < int(*blob.RawSize) {
+			rawBlobBuf = make([]byte, *blob.RawSize)
+		}
+		data = rawBlobBuf[:*blob.RawSize]
 		if _, err = io.ReadFull(reader, data); err != nil {
 			return data, fmt.Errorf("could not decompress zlib blob: %v", err)
 		}
@@ -221,4 +225,24 @@ func toRawData(blob *pbfproto.Blob) ([]byte, error) {
 		return data, fmt.Errorf("found unsupported blob format: %T", blob.Data)
 	}
 	return data, nil
+}
+
+func readAllIntoBuf(r io.Reader, b []byte) ([]byte, error) {
+	// Code is mostly copied from io.ReadAll.
+	b = b[:0]
+	for {
+		n, err := r.Read(b[len(b):cap(b)])
+		b = b[:len(b)+n]
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			return b, err
+		}
+
+		if len(b) == cap(b) {
+			// Add more capacity (let append pick how much).
+			b = append(b, 0)[:len(b)]
+		}
+	}
 }
